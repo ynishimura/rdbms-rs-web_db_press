@@ -61,21 +61,34 @@ impl BufferPool {
     fn size(&self) -> usize {
         self.buffers.len()
     }
-
+    // clock sweep algorithm
+    // 捨てるバッファを決めて、そのバッファIDを返すメソッド。
+    // すべてのバッファが貸出中で、捨てられるバッファがない場合Noneを返す。
     fn evict(&mut self) -> Option<BufferId> {
         let pool_size = self.size();
         let mut consecutive_pinned = 0;
+        // 捨てるバッファを決める巡回ループ
         let victim_id = loop {
             let next_victim_id = self.next_victim_id;
             let frame = &mut self[next_victim_id];
+
+            // バッファの利用回数をチェック
+            // usage_countはバッファ利用ごとにインクリメントされる
             if frame.usage_count == 0 {
+                // 利用されてないバッファIDを返す
                 break self.next_victim_id;
             }
+
+            // Rcから回数を確認して貸出中ではないことをチェック
             if Rc::get_mut(&mut frame.buffer).is_some() {
+                // デクリメント処理
                 frame.usage_count -= 1;
                 consecutive_pinned = 0;
             } else {
+                // バッファが貸出中ならインクリメント
                 consecutive_pinned += 1;
+
+                // すべてのバッファが貸出中なら諦めてNoneを返す
                 if consecutive_pinned >= pool_size {
                     return None;
                 }
@@ -121,26 +134,39 @@ impl BufferPoolManager {
     }
 
     pub fn fetch_page(&mut self, page_id: PageId) -> Result<Rc<Buffer>, Error> {
+        // ページがバッファプールにある場合
         if let Some(&buffer_id) = self.page_table.get(&page_id) {
+            // バッファを貸し出す
             let frame = &mut self.pool[buffer_id];
             frame.usage_count += 1;
             return Ok(Rc::clone(&frame.buffer));
         }
+
+        // ページがバッファプールにない場合
+        // 捨てるバッファ（読み込むページを格納するバッファする場所）を決める
         let buffer_id = self.pool.evict().ok_or(Error::NoFreeBuffer)?;
         let frame = &mut self.pool[buffer_id];
         let evict_page_id = frame.buffer.page_id;
         {
             let buffer = Rc::get_mut(&mut frame.buffer).unwrap();
+
+            // is_dirtyがTrueのとき、そのバッファをディスクに書き出す。
+            // id_dirtyとは
+            //  バッファ内容が変更されており、ディスク上の内容が古くなっていることを示すフラグ。
             if buffer.is_dirty.get() {
                 self.disk
                     .write_page_data(evict_page_id, buffer.page.get_mut())?;
             }
             buffer.page_id = page_id;
             buffer.is_dirty.set(false);
+
+            // ページを読み出す。
             self.disk.read_page_data(page_id, buffer.page.get_mut())?;
             frame.usage_count = 1;
         }
         let page = Rc::clone(&frame.buffer);
+
+        // バッファに入ってるページが入れ変わったので、ページテーブルを更新。
         self.page_table.remove(&evict_page_id);
         self.page_table.insert(page_id, buffer_id);
         Ok(page)
